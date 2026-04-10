@@ -70,6 +70,18 @@ inputs:
     description: 'TestFlight beta group name to assign builds to'
     required: false
     default: ''
+  code-sign-identity:
+    description: 'CODE_SIGN_IDENTITY override (e.g., "Apple Distribution"). Leave empty to use the project setting.'
+    required: false
+    default: ''
+  provisioning-profile-specifier:
+    description: 'PROVISIONING_PROFILE_SPECIFIER override. Use this when the project does not bake the profile name into project.yml (e.g., projects that use automatic signing locally).'
+    required: false
+    default: ''
+  development-team:
+    description: 'DEVELOPMENT_TEAM override (e.g., "6RXAHHH6UL"). Leave empty to use the project setting.'
+    required: false
+    default: ''
 
 outputs:
   ipa-path:
@@ -388,16 +400,29 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        xcodebuild archive \
-          -project ${{ inputs.scheme }}.xcodeproj \
-          -scheme ${{ inputs.scheme }} \
-          -destination 'generic/platform=iOS' \
-          -archivePath "$ARCHIVE_PATH" \
-          -derivedDataPath "$DERIVED_DATA" \
-          MARKETING_VERSION=${{ inputs.marketing-version }} \
-          CURRENT_PROJECT_VERSION=$BUILD_NUMBER \
-          CODE_SIGN_STYLE=Manual \
-          OTHER_CODE_SIGN_FLAGS="--keychain=$KEYCHAIN_PATH"
+        # Build the args dynamically so optional overrides only appear when set.
+        ARGS=(
+          archive
+          -project "${{ inputs.scheme }}.xcodeproj"
+          -scheme "${{ inputs.scheme }}"
+          -destination 'generic/platform=iOS'
+          -archivePath "$ARCHIVE_PATH"
+          -derivedDataPath "$DERIVED_DATA"
+          "MARKETING_VERSION=${{ inputs.marketing-version }}"
+          "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
+          CODE_SIGN_STYLE=Manual
+          "OTHER_CODE_SIGN_FLAGS=--keychain=$KEYCHAIN_PATH"
+        )
+        if [ -n "${{ inputs.code-sign-identity }}" ]; then
+          ARGS+=("CODE_SIGN_IDENTITY=${{ inputs.code-sign-identity }}")
+        fi
+        if [ -n "${{ inputs.provisioning-profile-specifier }}" ]; then
+          ARGS+=("PROVISIONING_PROFILE_SPECIFIER=${{ inputs.provisioning-profile-specifier }}")
+        fi
+        if [ -n "${{ inputs.development-team }}" ]; then
+          ARGS+=("DEVELOPMENT_TEAM=${{ inputs.development-team }}")
+        fi
+        xcodebuild "${ARGS[@]}"
 
     # ────────────────────────────────────────────────────────────────────
     # Step 10: Export IPA
