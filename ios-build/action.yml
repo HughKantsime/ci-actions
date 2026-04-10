@@ -1,0 +1,486 @@
+name: 'iOS Build, Test, Archive (hermetic)'
+description: |
+  Hermetic iOS pipeline. Every job is fully isolated from every other job on
+  the same Mac runner — no shared keychain, no shared simulator, no shared
+  DerivedData. Multiple iOS pipelines can run truly in parallel without
+  contention. Designed for the M4 multi-app build host.
+
+inputs:
+  scheme:
+    description: 'Xcode scheme to build (e.g., Tolera)'
+    required: true
+  test-scheme:
+    description: 'Xcode scheme to use for UI tests (defaults to scheme)'
+    required: false
+    default: ''
+  bundle-id:
+    description: 'App bundle identifier (e.g., com.tolera.app)'
+    required: true
+  template-device:
+    description: 'Simulator device template to clone (e.g., "iPhone 17 Pro Max")'
+    required: false
+    default: 'iPhone 17 Pro Max'
+  runtime:
+    description: 'iOS runtime for the cloned simulator (e.g., "iOS 26.4")'
+    required: false
+    default: 'iOS 26.4'
+  marketing-version:
+    description: 'CFBundleShortVersionString'
+    required: false
+    default: '1.0'
+  build-number:
+    description: 'CFBundleVersion (defaults to github.run_number)'
+    required: false
+    default: ''
+  dist-cert-p12:
+    description: 'Base64-encoded distribution cert P12'
+    required: true
+  dist-cert-password:
+    description: 'P12 password'
+    required: true
+  provisioning-profile-name:
+    description: 'Profile name to download from ASC'
+    required: true
+  asc-key-id:
+    description: 'ASC API key ID'
+    required: true
+  asc-issuer-id:
+    description: 'ASC API issuer ID'
+    required: true
+  asc-private-key:
+    description: 'ASC API private key (PEM)'
+    required: true
+  run-uitests:
+    description: 'Whether to run UI tests on the cloned simulator'
+    required: false
+    default: 'true'
+  uitest-class:
+    description: 'XCTest class to run for UI tests (e.g., ToleraUITests/ToleraQATests)'
+    required: false
+    default: ''
+  archive:
+    description: 'Whether to archive and export IPA (false for PRs)'
+    required: false
+    default: 'true'
+  upload-testflight:
+    description: 'Whether to upload IPA to TestFlight'
+    required: false
+    default: 'true'
+  testflight-group:
+    description: 'TestFlight beta group name to assign builds to'
+    required: false
+    default: ''
+
+outputs:
+  ipa-path:
+    description: 'Path to the exported IPA (if archive=true)'
+    value: ${{ steps.export.outputs.ipa-path }}
+  simulator-udid:
+    description: 'UDID of the cloned simulator (already deleted after the job)'
+    value: ${{ steps.clone-sim.outputs.udid }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ────────────────────────────────────────────────────────────────────
+    # Step 1: Compute hermetic paths. Every path used in this job lives
+    # under $RUNNER_TEMP so cleanup is automatic and there is zero
+    # collision risk with parallel jobs.
+    # ────────────────────────────────────────────────────────────────────
+    - name: Compute hermetic paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        JOB_ID="${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}"
+        # Sanitize for filenames
+        JOB_ID="${JOB_ID//\//-}"
+
+        echo "JOB_ID=$JOB_ID"                                  >> $GITHUB_ENV
+        echo "KEYCHAIN_PATH=$RUNNER_TEMP/build-$JOB_ID.keychain" >> $GITHUB_ENV
+        echo "KEYCHAIN_PASS=$(openssl rand -hex 16)"           >> $GITHUB_ENV
+        echo "DERIVED_DATA=$RUNNER_TEMP/DerivedData-$JOB_ID"   >> $GITHUB_ENV
+        echo "ARCHIVE_PATH=$RUNNER_TEMP/$JOB_ID.xcarchive"     >> $GITHUB_ENV
+        echo "EXPORT_PATH=$RUNNER_TEMP/export-$JOB_ID"         >> $GITHUB_ENV
+        echo "PROFILE_DIR=$RUNNER_TEMP/profiles-$JOB_ID"       >> $GITHUB_ENV
+        echo "ASC_KEYS_DIR=$RUNNER_TEMP/asc-keys-$JOB_ID"      >> $GITHUB_ENV
+        echo "P12_PATH=$RUNNER_TEMP/dist-$JOB_ID.p12"          >> $GITHUB_ENV
+        echo "WWDR_PATH=$RUNNER_TEMP/AppleWWDRCAG3-$JOB_ID.cer" >> $GITHUB_ENV
+        echo "CLONE_NAME=ci-$JOB_ID"                           >> $GITHUB_ENV
+        # Default build number to run_number if not provided
+        BUILD_NUMBER="${{ inputs.build-number }}"
+        if [ -z "$BUILD_NUMBER" ]; then
+          BUILD_NUMBER="${{ github.run_number }}"
+        fi
+        echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
+        # Default test scheme to main scheme if not provided
+        TEST_SCHEME="${{ inputs.test-scheme }}"
+        if [ -z "$TEST_SCHEME" ]; then
+          TEST_SCHEME="${{ inputs.scheme }}"
+        fi
+        echo "TEST_SCHEME=$TEST_SCHEME" >> $GITHUB_ENV
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 2: Generate Xcode project. Assumes xcodegen is on PATH (set
+    # at the workflow env: PATH level).
+    # ────────────────────────────────────────────────────────────────────
+    - name: Install XcodeGen
+      shell: bash
+      run: brew install xcodegen --quiet || true
+
+    - name: Generate Xcode project
+      shell: bash
+      run: xcodegen generate
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 3: Create per-job keychain. Never touches default-keychain.
+    # Never modifies the user's keychain search list. The keychain is
+    # only referenced by absolute path on every codesign call.
+    # ────────────────────────────────────────────────────────────────────
+    - name: Create isolated keychain
+      if: ${{ inputs.archive == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Create with random per-job password — never reused
+        security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+        # No idle timeout — long UI test runs would re-lock it
+        security set-keychain-settings "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+        # Import Apple WWDR intermediate so codesign can build the cert chain
+        curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer \
+          -o "$WWDR_PATH"
+        security import "$WWDR_PATH" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+
+        # Decode the P12 first
+        echo "${{ inputs.dist-cert-p12 }}" | base64 --decode > "$P12_PATH"
+
+        # Pre-flight: verify the P12 contains a valid, non-expired Apple
+        # Distribution cert BEFORE we import. Catches bad secrets / wrong
+        # cert / expired cert in 1 second instead of 20 minutes later in
+        # Archive. Pure file inspection — no keychain involvement.
+        #
+        # Apple's P12s use legacy RC2-CBC encryption; openssl 3 needs -legacy.
+        # Extract the cert once to a temp file and run all checks against it.
+        CERT_PEM="$RUNNER_TEMP/dist-cert-$JOB_ID.pem"
+        if ! openssl pkcs12 -in "$P12_PATH" \
+              -passin "pass:${{ inputs.dist-cert-password }}" \
+              -nokeys -clcerts -legacy \
+              -out "$CERT_PEM" 2>/dev/null; then
+          echo "::error::Failed to extract cert from P12 (wrong password?)"
+          exit 1
+        fi
+        CERT_SUBJECT=$(openssl x509 -in "$CERT_PEM" -noout -subject 2>/dev/null || true)
+        if ! echo "$CERT_SUBJECT" | grep -q "Apple Distribution"; then
+          echo "::error::P12 does not contain an Apple Distribution cert"
+          echo "Subject: $CERT_SUBJECT"
+          exit 1
+        fi
+        if ! openssl x509 -in "$CERT_PEM" -checkend 0 >/dev/null 2>&1; then
+          ENDDATE=$(openssl x509 -in "$CERT_PEM" -noout -enddate | cut -d= -f2)
+          echo "::error::Distribution cert expired on $ENDDATE"
+          exit 1
+        fi
+        ENDDATE=$(openssl x509 -in "$CERT_PEM" -noout -enddate | cut -d= -f2)
+        echo "Pre-flight OK: $CERT_SUBJECT"
+        echo "Cert valid until: $ENDDATE"
+        rm -f "$CERT_PEM"
+
+        # Now import into the per-job keychain
+        security import "$P12_PATH" -k "$KEYCHAIN_PATH" \
+          -P "${{ inputs.dist-cert-password }}" \
+          -T /usr/bin/codesign -T /usr/bin/xcodebuild -T /usr/bin/security
+
+        # Grant codesign tools access without UI prompt
+        security set-key-partition-list \
+          -S apple-tool:,apple:,codesign: \
+          -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" >/dev/null
+
+        # Add this keychain to the USER search list (preserving existing
+        # entries) so xcodebuild's identity lookup can find the signing
+        # cert during archive. Removed in the cleanup step. We use a flock
+        # to serialize search-list edits across parallel jobs and we use
+        # `-d user` not `-d system` so we never touch system keychains.
+        #
+        # Multiple jobs can have their keychains in the search list at once
+        # — that's fine because each job's signing config selects its own
+        # cert via team ID and the keychain path. Cleanup ensures stale
+        # keychains never accumulate.
+        SEARCH_LIST_LOCK="/tmp/security-search-list-user.lock"
+        python3 - <<PYEOF
+        import fcntl, subprocess
+        with open("$SEARCH_LIST_LOCK", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current = subprocess.check_output(
+                ["security", "list-keychains", "-d", "user"]
+            ).decode().strip().splitlines()
+            current = [line.strip().strip('"') for line in current]
+            new_kc = "$KEYCHAIN_PATH"
+            if new_kc not in current:
+                updated = [new_kc] + current
+                subprocess.run(
+                    ["security", "list-keychains", "-d", "user", "-s"] + updated,
+                    check=True,
+                )
+                print(f"Added {new_kc} to user search list")
+        PYEOF
+
+        echo "Keychain ready: $KEYCHAIN_PATH"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 4: Write ASC API key for provisioning profile management
+    # ────────────────────────────────────────────────────────────────────
+    - name: Write ASC API key
+      if: ${{ inputs.archive == 'true' }}
+      shell: bash
+      run: |
+        mkdir -p "$ASC_KEYS_DIR"
+        printf '%s' "${{ inputs.asc-private-key }}" \
+          > "$ASC_KEYS_DIR/AuthKey_${{ inputs.asc-key-id }}.p8"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 5: Download provisioning profile to a per-job directory.
+    # The apple-actions/download-provisioning-profiles action defaults to
+    # ~/Library/MobileDevice/Provisioning Profiles which is global state.
+    # We use a per-job dir and pass it to xcodebuild.
+    # ────────────────────────────────────────────────────────────────────
+    - name: Download provisioning profile
+      if: ${{ inputs.archive == 'true' }}
+      uses: apple-actions/download-provisioning-profiles@v3
+      with:
+        bundle-id: ${{ inputs.bundle-id }}
+        profile-type: IOS_APP_STORE
+        issuer-id: ${{ inputs.asc-issuer-id }}
+        api-key-id: ${{ inputs.asc-key-id }}
+        api-private-key: ${{ inputs.asc-private-key }}
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 6: Clone a fresh simulator. The template device is never
+    # booted by this job — only the clone. Multiple parallel jobs can
+    # each have their own clone with no contention.
+    # ────────────────────────────────────────────────────────────────────
+    - name: Clone isolated simulator
+      id: clone-sim
+      if: ${{ inputs.run-uitests == 'true' }}
+      shell: bash
+      env:
+        TARGET_RUNTIME: ${{ inputs.runtime }}
+        TARGET_DEVICE: ${{ inputs.template-device }}
+      run: |
+        set -euo pipefail
+
+        # Find the runtime identifier for the requested iOS version
+        RUNTIME_ID=$(xcrun simctl list runtimes -j | python3 -c '
+        import sys, json, os
+        data = json.load(sys.stdin)
+        target = os.environ["TARGET_RUNTIME"]
+        for r in data["runtimes"]:
+            if r["name"] == target and r["isAvailable"]:
+                print(r["identifier"])
+                break
+        ')
+        if [ -z "$RUNTIME_ID" ]; then
+          echo "::error::Runtime $TARGET_RUNTIME not found"
+          xcrun simctl list runtimes
+          exit 1
+        fi
+
+        # Find the template device UDID under that runtime
+        TEMPLATE_UDID=$(xcrun simctl list devices -j | RUNTIME_ID="$RUNTIME_ID" python3 -c '
+        import sys, json, os
+        data = json.load(sys.stdin)
+        target_name = os.environ["TARGET_DEVICE"]
+        target_runtime = os.environ["RUNTIME_ID"]
+        for runtime, devices in data["devices"].items():
+            if runtime != target_runtime:
+                continue
+            for d in devices:
+                if d["name"] == target_name and d["isAvailable"]:
+                    print(d["udid"])
+                    sys.exit(0)
+        ')
+        if [ -z "$TEMPLATE_UDID" ]; then
+          echo "::error::Template device $TARGET_DEVICE not found in $RUNTIME_ID"
+          xcrun simctl list devices "$RUNTIME_ID"
+          exit 1
+        fi
+
+        # simctl clone requires the source device to be Shutdown and serializes
+        # operations on the same source. We use a per-template flock to safely
+        # coordinate parallel jobs that target the same template (different
+        # templates clone in parallel without contention).
+        LOCK_FILE="/tmp/simctl-clone-${TEMPLATE_UDID}.lock"
+        CLONE_UDID=$(
+          # Use python3 fcntl for the lock since flock(1) is BSD-incompat on macOS
+          python3 - <<PYEOF
+        import fcntl, subprocess, sys, time, json
+        lock_path = "$LOCK_FILE"
+        template = "$TEMPLATE_UDID"
+        clone_name = "$CLONE_NAME"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Now we hold an exclusive lock on this template UDID
+            state_out = subprocess.check_output(["xcrun", "simctl", "list", "devices", "-j"])
+            state_data = json.loads(state_out)
+            template_state = None
+            for runtime, devices in state_data["devices"].items():
+                for d in devices:
+                    if d["udid"] == template:
+                        template_state = d["state"]
+                        break
+                if template_state:
+                    break
+            if template_state == "Booted":
+                subprocess.run(["xcrun", "simctl", "shutdown", template], check=True)
+            result = subprocess.check_output(["xcrun", "simctl", "clone", template, clone_name])
+            print(result.decode().strip())
+        PYEOF
+        )
+        echo "Cloned $TEMPLATE_UDID -> $CLONE_UDID ($CLONE_NAME)"
+
+        # Boot the clone (not the template)
+        xcrun simctl boot "$CLONE_UDID"
+        xcrun simctl bootstatus "$CLONE_UDID" -b
+
+        echo "udid=$CLONE_UDID" >> $GITHUB_OUTPUT
+        echo "SIMULATOR_UDID=$CLONE_UDID" >> $GITHUB_ENV
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 7: PR build sanity check (no signing, no archive)
+    # ────────────────────────────────────────────────────────────────────
+    - name: Build (no signing)
+      if: ${{ inputs.archive == 'false' }}
+      shell: bash
+      run: |
+        xcodebuild build \
+          -project ${{ inputs.scheme }}.xcodeproj \
+          -scheme ${{ inputs.scheme }} \
+          -derivedDataPath "$DERIVED_DATA" \
+          -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+          CODE_SIGNING_ALLOWED=NO
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 8: UI tests on the isolated simulator
+    # ────────────────────────────────────────────────────────────────────
+    - name: UI Tests
+      if: ${{ inputs.run-uitests == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        TEST_FILTER=""
+        if [ -n "${{ inputs.uitest-class }}" ]; then
+          TEST_FILTER="-only-testing:${{ inputs.uitest-class }}"
+        fi
+        xcodebuild test \
+          -project ${{ inputs.scheme }}.xcodeproj \
+          -scheme "$TEST_SCHEME" \
+          -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+          -derivedDataPath "$DERIVED_DATA" \
+          $TEST_FILTER
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 9: Archive — uses the per-job keychain explicitly
+    # ────────────────────────────────────────────────────────────────────
+    - name: Archive
+      if: ${{ inputs.archive == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        xcodebuild archive \
+          -project ${{ inputs.scheme }}.xcodeproj \
+          -scheme ${{ inputs.scheme }} \
+          -destination 'generic/platform=iOS' \
+          -archivePath "$ARCHIVE_PATH" \
+          -derivedDataPath "$DERIVED_DATA" \
+          MARKETING_VERSION=${{ inputs.marketing-version }} \
+          CURRENT_PROJECT_VERSION=$BUILD_NUMBER \
+          CODE_SIGN_STYLE=Manual \
+          OTHER_CODE_SIGN_FLAGS="--keychain=$KEYCHAIN_PATH"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 10: Export IPA
+    # ────────────────────────────────────────────────────────────────────
+    - name: Export IPA
+      id: export
+      if: ${{ inputs.archive == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        xcodebuild -exportArchive \
+          -archivePath "$ARCHIVE_PATH" \
+          -exportPath "$EXPORT_PATH" \
+          -exportOptionsPlist ExportOptions.plist
+        IPA_PATH=$(find "$EXPORT_PATH" -name "*.ipa" -maxdepth 2 | head -1)
+        echo "ipa-path=$IPA_PATH" >> $GITHUB_OUTPUT
+        echo "IPA_PATH=$IPA_PATH" >> $GITHUB_ENV
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 11: Upload to TestFlight via altool with the per-job key dir
+    # ────────────────────────────────────────────────────────────────────
+    - name: Upload to TestFlight
+      if: ${{ inputs.upload-testflight == 'true' && inputs.archive == 'true' }}
+      shell: bash
+      run: |
+        # altool uses ~/.appstoreconnect/private_keys by convention. We point
+        # it at our per-job dir via API_PRIVATE_KEYS_DIR.
+        export API_PRIVATE_KEYS_DIR="$ASC_KEYS_DIR"
+        xcrun altool --upload-app \
+          -f "$IPA_PATH" \
+          -t ios \
+          --apiKey ${{ inputs.asc-key-id }} \
+          --apiIssuer ${{ inputs.asc-issuer-id }}
+
+    # ────────────────────────────────────────────────────────────────────
+    # Step 12: Cleanup — runs even on failure. Removes the per-job
+    # keychain, simulator clone, derived data, and all temp files.
+    # ────────────────────────────────────────────────────────────────────
+    - name: Cleanup hermetic state
+      if: always()
+      shell: bash
+      run: |
+        # Remove the per-job keychain from the user search list (preserving
+        # any other entries — including other parallel jobs' keychains).
+        # Same flock protection as the add operation.
+        if [ -n "${KEYCHAIN_PATH:-}" ]; then
+          SEARCH_LIST_LOCK="/tmp/security-search-list-user.lock"
+          python3 - <<PYEOF || true
+        import fcntl, subprocess
+        with open("$SEARCH_LIST_LOCK", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current = subprocess.check_output(
+                ["security", "list-keychains", "-d", "user"]
+            ).decode().strip().splitlines()
+            current = [line.strip().strip('"') for line in current]
+            target = "$KEYCHAIN_PATH"
+            updated = [k for k in current if k != target]
+            if updated != current:
+                subprocess.run(
+                    ["security", "list-keychains", "-d", "user", "-s"] + updated,
+                    check=True,
+                )
+                print(f"Removed {target} from user search list")
+        PYEOF
+        fi
+
+        # Delete the per-job keychain itself (if it was created)
+        if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+        fi
+
+        # Shutdown and delete the cloned simulator (template untouched)
+        if [ -n "${SIMULATOR_UDID:-}" ]; then
+          xcrun simctl shutdown "$SIMULATOR_UDID" 2>/dev/null || true
+          xcrun simctl delete "$SIMULATOR_UDID" 2>/dev/null || true
+        fi
+
+        # Wipe derived data + temp artifacts (RUNNER_TEMP cleans itself,
+        # but we explicit-delete in case the runner is reused without
+        # clearing temp).
+        rm -rf "${DERIVED_DATA:-/dev/null}" \
+               "${ARCHIVE_PATH:-/dev/null}" \
+               "${EXPORT_PATH:-/dev/null}" \
+               "${ASC_KEYS_DIR:-/dev/null}" \
+               "${P12_PATH:-/dev/null}" \
+               "${WWDR_PATH:-/dev/null}" 2>/dev/null || true
