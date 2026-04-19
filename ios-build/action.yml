@@ -205,10 +205,33 @@ runs:
           -P "${{ inputs.dist-cert-password }}" \
           -T /usr/bin/codesign -T /usr/bin/xcodebuild -T /usr/bin/security
 
-        # Grant codesign tools access without UI prompt
-        security set-key-partition-list \
-          -S apple-tool:,apple:,codesign: \
-          -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" >/dev/null
+        # Grant codesign tools access without UI prompt.
+        # On macOS Sequoia the partition-list call can fail when the runner
+        # hasn't had an interactive session recently. We try twice (the second
+        # attempt unlocks again first) and fall back to the login keychain so
+        # at least one keychain in the search list has the key with proper ACL.
+        if ! security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" 2>/dev/null; then
+          echo "::warning::set-key-partition-list failed on per-job keychain — retrying after re-unlock"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" 2>/dev/null || true
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" 2>/dev/null || \
+            echo "::warning::set-key-partition-list still failed — falling back to login keychain"
+        fi
+        # Fallback: also import into the login keychain with full ACL.
+        # codesign will find the identity there if the per-job keychain ACL fails.
+        LOGIN_KC="$HOME/Library/Keychains/login.keychain-db"
+        if [ -f "$LOGIN_KC" ]; then
+          security import "$P12_PATH" -k "$LOGIN_KC" \
+            -P "${{ inputs.dist-cert-password }}" \
+            -T /usr/bin/codesign -T /usr/bin/xcodebuild -T /usr/bin/security \
+            -A 2>/dev/null || true
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "" "$LOGIN_KC" 2>/dev/null || true
+        fi
 
         # Add this keychain to the USER search list (preserving existing
         # entries) so xcodebuild's identity lookup can find the signing
@@ -411,7 +434,12 @@ runs:
           "MARKETING_VERSION=${{ inputs.marketing-version }}"
           "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
           CODE_SIGN_STYLE=Manual
-          "OTHER_CODE_SIGN_FLAGS=--keychain=$KEYCHAIN_PATH"
+          # Do NOT restrict codesign to --keychain=<per-job> on macOS Sequoia:
+          # set-key-partition-list is session-ephemeral and the per-job keychain
+          # ACL can fail silently. CODE_SIGN_IDENTITY + DEVELOPMENT_TEAM uniquely
+          # select the cert across all keychains in the search list, which
+          # includes both the per-job keychain and the login keychain fallback
+          # we import into above.
         )
         if [ -n "${{ inputs.code-sign-identity }}" ]; then
           ARGS+=("CODE_SIGN_IDENTITY=${{ inputs.code-sign-identity }}")
