@@ -434,12 +434,7 @@ runs:
           "MARKETING_VERSION=${{ inputs.marketing-version }}"
           "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
           CODE_SIGN_STYLE=Manual
-          # Do NOT restrict codesign to --keychain=<per-job> on macOS Sequoia:
-          # set-key-partition-list is session-ephemeral and the per-job keychain
-          # ACL can fail silently. CODE_SIGN_IDENTITY + DEVELOPMENT_TEAM uniquely
-          # select the cert across all keychains in the search list, which
-          # includes both the per-job keychain and the login keychain fallback
-          # we import into above.
+          "OTHER_CODE_SIGN_FLAGS=--keychain=$KEYCHAIN_PATH"
         )
         if [ -n "${{ inputs.code-sign-identity }}" ]; then
           ARGS+=("CODE_SIGN_IDENTITY=${{ inputs.code-sign-identity }}")
