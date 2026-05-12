@@ -385,11 +385,11 @@ runs:
     # ────────────────────────────────────────────────────────────────────
     # Step 7: PR build sanity check (no signing, no archive)
     #
-    # Uses a GENERIC destination so we don't depend on Step 6 (clone-sim),
-    # which is gated on run-uitests=true. Without this, a PR check with
-    # run-uitests=false would pass an empty SIMULATOR_UDID and xcodebuild
-    # would die with "missing value for key 'id' of option 'Destination'".
-    # Generic destination only needs the iphonesimulator SDK to be present.
+    # Uses `generic/platform=iOS` (device target, no signing) so the build
+    # doesn't depend on CoreSimulator service. The simulator-targeted
+    # version of this step kept breaking when Xcode auto-updated on the
+    # runner but the CoreSimulator framework lagged behind — same problem
+    # as the per-archive recipe, so use the same destination.
     # ────────────────────────────────────────────────────────────────────
     - name: Build (no signing)
       if: ${{ inputs.archive == 'false' }}
@@ -399,7 +399,7 @@ runs:
           -project ${{ inputs.scheme }}.xcodeproj \
           -scheme ${{ inputs.scheme }} \
           -derivedDataPath "$DERIVED_DATA" \
-          -destination 'generic/platform=iOS Simulator' \
+          -destination 'generic/platform=iOS' \
           CODE_SIGNING_ALLOWED=NO
 
     # ────────────────────────────────────────────────────────────────────
