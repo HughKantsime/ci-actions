@@ -22,8 +22,9 @@ concurrently. The failure modes are subtle and hard to debug:
 Every job that uses this action gets:
 
 1. **Per-job keychain** at `$RUNNER_TEMP/build-<run_id>.keychain` with a
-   randomly generated password. Never modifies `default-keychain`. Never
-   touches the user's keychain search list.
+   randomly generated password. Never modifies `default-keychain`. Adds the
+   per-job keychain to the user search list only for the duration of the job,
+   then removes it during cleanup.
 2. **Cloned simulator** — a fresh clone of the requested template device.
    The template is never booted by this job, only the clone. The clone is
    deleted in the cleanup step.
@@ -73,6 +74,11 @@ Every job that uses this action gets:
     upload-testflight: ${{ github.event_name == 'push' }}
     uitest-class: 'MyAppUITests/QATests'
 ```
+
+For runners where macOS Sequoia rejects `codesign --keychain=<per-job>` with
+`errSecInternalComponent`, set `use-keychain-flag: 'false'`. The action still
+uses the isolated keychain and login-keychain fallback, but lets `codesign`
+search the keychain list for the selected identity.
 
 ## Inputs
 

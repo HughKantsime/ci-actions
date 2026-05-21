@@ -82,6 +82,10 @@ inputs:
     description: 'DEVELOPMENT_TEAM override (e.g., "6RXAHHH6UL"). Leave empty to use the project setting.'
     required: false
     default: ''
+  use-keychain-flag:
+    description: 'Whether to pass OTHER_CODE_SIGN_FLAGS=--keychain=<per-job>. Set false when Sequoia ACL fallback via login keychain is needed.'
+    required: false
+    default: 'true'
 
 outputs:
   ipa-path:
@@ -440,8 +444,10 @@ runs:
           "MARKETING_VERSION=${{ inputs.marketing-version }}"
           "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
           CODE_SIGN_STYLE=Manual
-          "OTHER_CODE_SIGN_FLAGS=--keychain=$KEYCHAIN_PATH"
         )
+        if [ "${{ inputs.use-keychain-flag }}" = "true" ]; then
+          ARGS+=("OTHER_CODE_SIGN_FLAGS=--keychain=$KEYCHAIN_PATH")
+        fi
         if [ -n "${{ inputs.code-sign-identity }}" ]; then
           ARGS+=("CODE_SIGN_IDENTITY=${{ inputs.code-sign-identity }}")
         fi
