@@ -162,13 +162,17 @@ runs:
         security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
         # No idle timeout — long UI test runs would re-lock it
-        security set-keychain-settings "$KEYCHAIN_PATH"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
         security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
-        # Import Apple WWDR intermediate so codesign can build the cert chain
-        curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer \
-          -o "$WWDR_PATH"
-        security import "$WWDR_PATH" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+        # Import current Apple WWDR intermediates so codesign can build the
+        # Apple Distribution certificate chain on fresh self-hosted runners.
+        for wwdr in AppleWWDRCAG3 AppleWWDRCAG4 AppleWWDRCAG5 AppleWWDRCAG6; do
+          curl -fsSL "https://www.apple.com/certificateauthority/${wwdr}.cer" \
+            -o "$RUNNER_TEMP/${wwdr}-$JOB_ID.cer"
+          security import "$RUNNER_TEMP/${wwdr}-$JOB_ID.cer" \
+            -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
+        done
 
         # Decode the P12 first
         echo "${{ inputs.dist-cert-p12 }}" | base64 --decode > "$P12_PATH"
@@ -267,6 +271,7 @@ runs:
         PYEOF
 
         echo "Keychain ready: $KEYCHAIN_PATH"
+        security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
     # ────────────────────────────────────────────────────────────────────
     # Step 4: Write ASC API key for provisioning profile management
