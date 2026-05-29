@@ -75,10 +75,10 @@ Every job that uses this action gets:
     uitest-class: 'MyAppUITests/QATests'
 ```
 
-For runners where macOS Sequoia rejects `codesign --keychain=<per-job>` with
-`errSecInternalComponent`, set `use-keychain-flag: 'false'`. The action still
-uses the isolated keychain and login-keychain fallback, but lets `codesign`
-search the keychain list for the selected identity.
+Archive always pins `codesign` to the per-job keychain with
+`OTHER_CODE_SIGN_FLAGS=--keychain=<per-job>`. If keychain partition-list setup
+fails, the action exits loudly instead of continuing to a path that can trigger
+an interactive codesign prompt.
 
 ## Inputs
 
